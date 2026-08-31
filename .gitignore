@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+
+# Experiment artifacts and dataset caches: reproducible from configs, never committed.
+runs/
+data/cache/
+*.npz
+.DS_Store
+
+# Raw external datasets: 40GB, re-downloadable from the Hub.
+data/raw/

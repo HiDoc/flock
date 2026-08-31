@@ -1,0 +1,54 @@
+# V0 baseline configuration (spec §3.4).
+# One change per run: copy this file, change exactly one thing, name the run
+# after it. `flock train --change <kebab-case>` enforces the naming.
+
+cell:
+  hidden_dim: 32          # A9 sweeps {16, 32, 64}
+  mlp_width: 96           # fallback 128-192 if underfitting
+  delta_scale: 0.25       # alpha; A4 tests deltas vs absolute logits
+  temperature: 1.0        # tau, fixed in V0
+  fire_rate: 1.0          # A7 tests 0.5
+  shared_weights: true    # A2 tests false
+
+losses:
+  weight_l1: 1.0
+  deformation: 1.0        # the metric that counts (H3); A8 tests 0.0
+  stability: 0.05         # forces delta -> 0 at the fixed point
+  support: 0.0            # V0.5, only if Dice is the weak point
+  deformation_warmup_steps: 1000
+
+training:
+  # 16, not 32: mesh-steps/s is flat, so this is the same compute for ~2x the
+  # optimiser steps, which puts the spec's 10-15k budget back in reach (ADR-0007).
+  batch_size: 16
+  bptt_steps: 4           # gradients through 4 steps; the pool supplies the horizon
+  pool_size: 1024         # A3 tests without the pool
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  warmup_steps: 500
+  grad_clip: 1.0
+  max_steps: 15000        # ~48 min at the measured 5.25 steps/s (ADR-0007)
+  precision: fp32         # bf16 only if profiling shows a real wall
+  seed: 0
+  backend: mlx
+  log_every: 50           # batched: reading metrics every step serialises the GPU
+
+data:
+  # d0 procedural first: analytic GT, so any gap is the model's (R6). d1 is the
+  # canonical subset of Articulation-XL 2.0 -- 2,992 meshes, one 22-joint
+  # skeleton, selected not assumed (ADR-0005).
+  source: d0
+  target_vertices: 1024   # fixed shapes are mandatory (ADR-0003)
+  num_neighbours: 8
+  num_candidates: 8
+  candidate_metric: diffusion   # A6 tests 'euclidean' — the direct test of H1
+  train_poses: 24
+  test_poses: 8
+
+curriculum:                # spec §3.2; always keep a clean fraction (R3)
+  - until_step: 3000
+    mixture: {c0: 0.7, clean: 0.3}
+  - until_step: 8000
+    mixture: {c0: 0.3, c1: 0.4, clean: 0.3}
+  - until_step: 15000
+    mixture: {c0: 0.1, c1: 0.4, c2: 0.25, clean: 0.25}
