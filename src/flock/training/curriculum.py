@@ -53,6 +53,60 @@ def default_curriculum() -> tuple[CurriculumStage, ...]:
     )
 
 
+def confident_error_curriculum() -> tuple[CurriculumStage, ...]:
+    """`default_curriculum` with half of C1's share spent on C1P.
+
+    The one change that tests the ADR-0008 finding: every corruption the default
+    curriculum asks the model to repair arrives *flat*, so peakedness is a
+    near-perfect proxy for "needs work" and the model learns that instead of
+    learning to judge correctness. C1P is the same patch size and the same
+    budget, but peaked — confidence stops being evidence of being right.
+
+    C1's total share is unchanged, so the arm differs from the default in what
+    the corruption looks like and in nothing else.
+    """
+    swapped = []
+    for stage in default_curriculum():
+        mixture = dict(stage.mixture)
+        share = mixture.pop(CorruptionLevel.C1_LOCAL_PATCH, 0.0)
+        if share:
+            mixture[CorruptionLevel.C1_LOCAL_PATCH] = share / 2
+            mixture[CorruptionLevel.C1P_PERMUTED_PATCH] = share / 2
+        swapped.append(CurriculumStage(stage.until_step, mixture))
+    return tuple(swapped)
+
+
+def with_clean_share(
+    stages: tuple[CurriculumStage, ...], share: float
+) -> tuple[CurriculumStage, ...]:
+    """Set every stage's clean share to `share`, moving the difference to C0.
+
+    The lever for [ADR-0010]'s leading reading of why training on confident
+    errors failed: clean states are peaked by construction and ~45% of the
+    resident pool, so the signal saying *leave peaked states alone* outvotes
+    the one saying *fix these peaked states* roughly 3:1. Lowering it tests
+    that directly.
+
+    The freed mass goes to C0 rather than being spread, so the share of every
+    *other* level is untouched and the clean-to-corrupted ratio is the only
+    thing that moves. Note the pool keeps its own `CLEAN_FRACTION` of forced
+    clean slots regardless — §3.1's do-no-harm floor is not up for negotiation
+    here, so this cannot drive the clean signal to zero.
+    """
+    if not 0.0 <= share < 1.0:
+        raise ValueError(f"clean share must be in [0, 1), got {share}")
+    rescaled = []
+    for stage in stages:
+        mixture = dict(stage.mixture)
+        freed = mixture.get(CorruptionLevel.CLEAN, 0.0) - share
+        mixture[CorruptionLevel.CLEAN] = share
+        mixture[CorruptionLevel.C0_GAUSSIAN_LOGITS] = (
+            mixture.get(CorruptionLevel.C0_GAUSSIAN_LOGITS, 0.0) + freed
+        )
+        rescaled.append(CurriculumStage(stage.until_step, mixture))
+    return tuple(rescaled)
+
+
 def stage_for(stages: tuple[CurriculumStage, ...], step: int) -> CurriculumStage:
     """The stage active at `step`."""
     for stage in stages:

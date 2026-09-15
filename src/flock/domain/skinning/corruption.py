@@ -27,6 +27,9 @@ C0_SIGMA = 0.15
 PATCH_FRACTION = (0.05, 0.15)
 """Share of real vertices a C1/C2 patch covers (spec §3.2)."""
 
+C4_SIGMA = 0.25
+"""Relative noise on the near-uniform C4 field, before renormalisation."""
+
 
 class CorruptionLevel(StrEnum):
     """Curriculum levels, in increasing order of difficulty (spec §3.2)."""
@@ -36,6 +39,16 @@ class CorruptionLevel(StrEnum):
 
     C1_LOCAL_PATCH = "c1"
     """BFS patch of 5-15% of vertices, weights randomised or permuted. V0."""
+
+    C1P_PERMUTED_PATCH = "c1p"
+    """The other half of spec §3.2's C1 — "weights randomised **or permuted**".
+    Only the randomised half was implemented, and the two are not
+    interchangeable: randomising flattens a row, permuting preserves its shape
+    exactly and moves it to the wrong bone. Measurement showed the cell repairs
+    the flat kind and is blind to the peaked kind, so the omitted half is the
+    only one that trains it to judge correctness rather than confidence
+    (ADR-0008). Kept a separate level rather than folded into C1 so every
+    result measured against C1 stays comparable."""
 
     C2_HIERARCHY_TRANSFER = "c2"
     """Mass moved to a hierarchical neighbour bone over a patch. V0."""
@@ -64,6 +77,8 @@ class CorruptionContext:
     neighbour_mask: NDArray[np.bool_]
     vertex_mask: NDArray[np.bool_]
     candidate_bones: NDArray[np.int32]
+    candidate_mask: NDArray[np.bool_]
+    candidate_distances: NDArray[np.float32]
     bone_parents: NDArray[np.int32]
 
 
@@ -138,8 +153,10 @@ def corrupt(
     Returns:
         The corrupted field and a `[V]` bool mask of the affected region Ω.
 
-    Raises:
-        NotImplementedError: C3 and C4 arrive at V0.5.
+    C3 and C4 are *initialisations* rather than corruptions: they ignore
+    `weights` entirely and build a field from geometry alone. Gate G4 starts
+    from C3, which is the only place in this project where the model is asked
+    to produce a solution rather than repair one.
     """
     values = weights.values.astype(np.float64)
     nothing = np.zeros(values.shape[0], dtype=bool)
@@ -157,6 +174,17 @@ def corrupt(
         rows = np.flatnonzero(patch)
         if rows.size:
             corrupted[rows] = rng.random((rows.size, values.shape[1]))
+        return WeightField(_renormalise(corrupted)), patch
+
+    if level is CorruptionLevel.C1P_PERMUTED_PATCH:
+        patch = grow_patch(context, rng.uniform(*PATCH_FRACTION), rng)
+        corrupted = values.copy()
+        for vertex in np.flatnonzero(patch):
+            # Permute among the *valid* slots only: mass landing on a padding
+            # slot would be weight on a bone that is not a candidate at all.
+            slots = np.flatnonzero(context.candidate_mask[vertex])
+            if slots.size > 1:
+                corrupted[vertex, slots] = corrupted[vertex, rng.permutation(slots)]
         return WeightField(_renormalise(corrupted)), patch
 
     if level is CorruptionLevel.C2_HIERARCHY_TRANSFER:
@@ -185,4 +213,21 @@ def corrupt(
             corrupted[vertex, target] += moved
         return WeightField(_renormalise(corrupted)), patch
 
-    raise NotImplementedError(f"V0.5: corruption level {level.value}")
+    if level is CorruptionLevel.C3_NAIVE_GEOMETRIC:
+        # A from-scratch initialisation, not a corruption of anything: `weights`
+        # is deliberately unread. That makes the anti-leakage rule structural —
+        # C3 *cannot* carry ground truth into gate G4, because it never sees any
+        # (spec R7).
+        near = np.maximum(context.candidate_distances.astype(np.float64), 1e-6)
+        naive = np.where(context.candidate_mask, 1.0 / (near**2), 0.0)
+        return WeightField(_renormalise(naive)), context.vertex_mask.copy()
+
+    if level is CorruptionLevel.C4_NEAR_UNIFORM:
+        # The regime closest to genuine self-organisation: every candidate
+        # equally plausible, so nothing but the dynamics breaks the symmetry.
+        # `weights` is unread here too.
+        flat = context.candidate_mask.astype(np.float64)
+        jittered = flat * (1.0 + rng.normal(0.0, C4_SIGMA, flat.shape))
+        return WeightField(_renormalise(jittered)), context.vertex_mask.copy()
+
+    raise NotImplementedError(f"unhandled corruption level {level.value}")

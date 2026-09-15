@@ -72,6 +72,8 @@ class PreprocessedMesh:
             neighbour_mask=self.mesh.neighbour_mask,
             vertex_mask=self.mesh.vertex_mask,
             candidate_bones=self.candidates.bones,
+            candidate_mask=self.candidates.mask,
+            candidate_distances=self.candidates.distances,
             bone_parents=self.skeleton.parents,
         )
 

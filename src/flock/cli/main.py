@@ -153,6 +153,15 @@ def train(
     lr: float = typer.Option(3e-3, help="Higher than the 3e-4 default; G0.5 is a sprint."),
     steps: int = typer.Option(4000),
     meshes: int = typer.Option(400, help="Training meshes to hold resident."),
+    unshared: bool = typer.Option(False, help="A2/B3: give every step its own parameters."),
+    absolute: bool = typer.Option(False, help="A4: predict logits outright, not damped deltas."),
+    bptt: int = typer.Option(4, help="k: rollout length gradients flow through."),
+    confident_error: bool = typer.Option(
+        False, help="Train on C1P, the peaked corruption, for half of C1's share."
+    ),
+    clean_share: float = typer.Option(
+        -1.0, help="Override the curriculum's clean share; negative keeps the default."
+    ),
 ) -> None:
     """Train the cell, or run the single-mesh sanity gate."""
     from flock.domain.dynamics.state import CellConfig
@@ -164,7 +173,10 @@ def train(
 
         name = make_run_name("v0", change)
         settings = TrainConfig(
-            cell=CellConfig(), seed=seed, learning_rate=lr, max_steps=steps,
+            cell=CellConfig(shared_weights=not unshared, absolute_logits=absolute),
+            seed=seed, learning_rate=lr, max_steps=steps, bptt_steps=bptt,
+            confident_error=confident_error,
+            clean_share=clean_share if clean_share >= 0 else None,
         )
         typer.echo(f"run {name}: {steps} steps, batch {settings.batch_size}, {meshes} meshes")
         run_training(settings, name, cache=cache, num_meshes=meshes)
@@ -204,22 +216,19 @@ def evaluate(
     cache: Path = typer.Option(Path("data/cache/d1")),
     probe_size: int = typer.Option(8, help="Held-out meshes to evaluate on."),
     level: str = typer.Option("c1", help="Corruption applied to the input."),
+    unshared: bool = typer.Option(False, help="Set if the run was trained unshared."),
 ) -> None:
     """Evaluate a checkpoint over the probe set, tracing every metric by T."""
     from flock.data.store import DatasetRepository
     from flock.domain.dynamics.state import CellConfig
     from flock.domain.skinning.corruption import CorruptionLevel, corrupt
     from flock.evaluation.probe import EVAL_ITERATIONS, evaluate_by_iteration
+    from flock.evaluation.replication import load_checkpoint
     from flock.experiment.repository import RunRepository
 
     runs = RunRepository(Path("runs"))
-    with np.load(runs.path_for(run) / "checkpoint.npz") as data:
-        import mlx.core as mx
-
-        params: dict[str, dict[str, mx.array]] = {}
-        for flat_key in data.files:
-            group, key = flat_key.split(".", 1)
-            params.setdefault(group, {})[key] = mx.array(data[flat_key])
+    cell = CellConfig(shared_weights=not unshared)
+    params = load_checkpoint(runs.path_for(run), cell)
 
     repo = DatasetRepository(cache)
     ids = repo.list_ids()[-probe_size:]          # held out from the training prefix
@@ -230,12 +239,86 @@ def evaluate(
         for s in samples
     ])
 
-    curves = evaluate_by_iteration(params, samples, CellConfig(), initial)
+    curves = evaluate_by_iteration(params, samples, cell, initial)
     header = "  ".join(f"T={t:<7}" for t in EVAL_ITERATIONS)
     typer.echo(f"{'metric':<12} {header}")
     for name, curve in curves.items():
         row = "  ".join(f"{v:<9.4f}" for v in curve.values)
         typer.echo(f"{name:<12} {row}")
+
+    # §8: every curve is serialised beside the checkpoint that produced it, so a
+    # printed table is never the only record of a result.
+    runs.save_curves(
+        run,
+        level,
+        {"iterations": list(EVAL_ITERATIONS), "meshes": ids,
+         **{name: list(curve.values) for name, curve in curves.items()}},
+    )
+
+    # Indicative readings only: G1 also requires beating B3, and G2/G3 have
+    # their own protocols. Both land at M4.
+    l1 = curves["weight_l1"].values
+    at1, at8, at32 = l1[EVAL_ITERATIONS.index(1)], l1[EVAL_ITERATIONS.index(8)], l1[-1]
+    gain, drift = at8 / max(at1, 1e-9), at32 / max(at8, 1e-9)
+    typer.echo(f"\nrecurrence gain  L1(T=8)/L1(T=1) = {gain:.3f}  (G1 wants <= 0.80)")
+    typer.echo(f"drift past T=8   L1(T=32)/L1(T=8) = {drift:.3f}  (G2 wants <= 1.05)")
+    typer.secho(
+        "indicative only — G1 needs B3, G2/G3 need their own runs (M4)",
+        fg=typer.colors.YELLOW,
+    )
+
+
+@app.command()
+def repair(
+    run: str = typer.Option(..., help="Run name to evaluate."),
+    cache: Path = typer.Option(Path("data/cache/d1")),
+    probe_size: int = typer.Option(8, help="Held-out meshes to evaluate on."),
+    level: str = typer.Option("c1", help="Corruption applied to the converged state."),
+    settle: int = typer.Option(8, help="Steps run before the damage."),
+    seed: int = typer.Option(0),
+    unshared: bool = typer.Option(False, help="Set if the run was trained unshared."),
+) -> None:
+    """Gate G3: does a converged state repair local damage without collateral harm?"""
+    from flock.data.store import DatasetRepository
+    from flock.domain.dynamics.state import CellConfig
+    from flock.evaluation.gates import GateStatus, evaluate_gate
+    from flock.evaluation.probe import evaluate_repair
+    from flock.evaluation.replication import load_checkpoint
+    from flock.experiment.repository import RunRepository
+
+    runs = RunRepository(Path("runs"))
+    cell = CellConfig(shared_weights=not unshared)
+    params = load_checkpoint(runs.path_for(run), cell)
+
+    repo = DatasetRepository(cache)
+    ids = repo.list_ids()[-probe_size:]          # held out from the training prefix
+    samples = [repo.load(i)[0] for i in ids]
+
+    result = evaluate_repair(params, samples, cell, level=level, settle=settle, seed=seed)
+    typer.echo(f"episodes          : {result['episodes']} ({result['dropped']} induced no error)")
+    typer.echo(f"region size       : {result['region_fraction']:.1%} of real vertices")
+    header = "  ".join(f"T={t:<5}" for t in result["iterations"])
+    typer.echo(f"\n{'metric':<20} {header}")
+    for name, curve in result["curves"].items():
+        typer.echo(f"{name:<20} " + "  ".join(f"{v:<7.3f}" for v in curve))
+
+    verdict = evaluate_gate("G3", {
+        "repaired_fraction": result["repaired_fraction"],
+        "collateral_relative": result["collateral_relative"],
+    })
+    typer.echo(
+        f"\nrepaired @T={result['iterations'][-1]}  : "
+        f"{result['repaired_fraction']:.3f}  (G3 needs >= 0.80)"
+    )
+    typer.echo(
+        f"collateral        : {result['collateral_relative']:.3f}  (G3 needs < 0.10)"
+    )
+    runs.save_curves(run, f"repair_{level}", result)
+    typer.secho(
+        f"GATE G3: {verdict.status.value.upper()}",
+        fg=typer.colors.GREEN if verdict.status is GateStatus.PASS else typer.colors.RED,
+        bold=True,
+    )
 
 
 @app.command()

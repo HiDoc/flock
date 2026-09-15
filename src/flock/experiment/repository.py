@@ -88,6 +88,16 @@ class RunRepository:
         with (self.path_for(name) / "metrics.jsonl").open("a") as handle:
             handle.write(json.dumps(metrics, default=str) + "\n")
 
+    def save_curves(self, name: str, label: str, curves: dict[str, Any]) -> Path:
+        """Write one by-iteration evaluation beside the checkpoint (spec §8).
+
+        Named by the corruption it started from, so several evaluations of the
+        same checkpoint coexist rather than overwriting each other.
+        """
+        path = self.path_for(name) / f"curves_{label}.json"
+        path.write_text(json.dumps(curves, indent=2, default=str))
+        return path
+
     def save_checkpoint(self, name: str, params: dict[str, dict[str, Any]]) -> Path:
         """Write the parameter tree beside the config that produced it."""
         path = self.path_for(name) / "checkpoint.npz"

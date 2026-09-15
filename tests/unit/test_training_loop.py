@@ -71,7 +71,7 @@ def test_evaluation_returns_a_curve_per_metric() -> None:
     curves = evaluate_by_iteration(
         init_params(config, 0), samples, config, initial, iterations=iterations
     )
-    assert set(curves) == {"weight_l1", "deformation", "dice", "bleeding", "stability"}
+    assert set(curves) == {"weight_l1", "deformation", "dice", "bleeding", "stability_per_step"}
     for curve in curves.values():
         assert len(curve.values) == len(iterations)
 

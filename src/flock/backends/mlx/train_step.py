@@ -30,17 +30,6 @@ from flock.backends.mlx.rollout import rollout
 from flock.domain.dynamics.state import CellConfig, CellState, StaticInputs
 
 
-def masked_weight_l1(predicted: mx.array, target: mx.array, vertex_mask: mx.array) -> mx.array:
-    """Mean per-vertex L1 over real vertices only.
-
-    Padded rows are excluded rather than averaged in; letting them count would
-    scale the loss by the padding ratio and make meshes of different sizes
-    incomparable.
-    """
-    per_vertex = mx.sum(mx.abs(predicted - target), axis=-1)
-    return mx.sum(per_vertex * vertex_mask) / mx.maximum(mx.sum(vertex_mask), 1.0)
-
-
 def make_full_loss(config: CellConfig, steps: int, overflow: int = 1) -> Callable[..., Any]:
     """Loss over a `steps` rollout, with `overflow` unsupervised steps past it.
 
@@ -86,29 +75,6 @@ def make_full_loss(config: CellConfig, steps: int, overflow: int = 1) -> Callabl
     return loss_fn
 
 
-def make_loss(config: CellConfig, steps: int) -> Callable[..., Any]:
-    """Build the loss over a `steps`-long rollout."""
-
-    def loss_fn(
-        params: Params,
-        batch: dict[str, mx.array],
-        static_tree: dict[str, mx.array],
-    ) -> mx.array:
-        static = StaticInputs(**static_tree)
-        state = CellState(
-            hidden=mx.zeros(
-                (batch["initial_logits"].shape[0], batch["initial_logits"].shape[1],
-                 config.hidden_dim)
-            ),
-            logits=batch["initial_logits"],
-        )
-        final = rollout(params, state, static, steps, config)
-        predicted = weights_of(final, config, static)
-        return masked_weight_l1(predicted, batch["target"], static.vertex_mask)
-
-    return loss_fn
-
-
 def make_pool_train_step(
     config: CellConfig,
     steps: int,
@@ -137,37 +103,6 @@ def make_pool_train_step(
         updated: Params = optimizer.apply_gradients(grads, params)
         hidden, logits, l_weight, l_deform, l_stability = aux
         return updated, total, hidden, logits, (l_weight, l_deform, l_stability)
-
-    if not compile_step:
-        return step
-    return mx.compile(step, inputs=state, outputs=state)
-
-
-def make_train_step(
-    config: CellConfig,
-    steps: int,
-    optimizer: optim.Optimizer,
-    compile_step: bool = True,
-) -> Callable[..., Any]:
-    """Build the M2 sanity-gate step, compiled as one unit.
-
-    Returns a callable `(params, batch, static) -> (params, loss)`. The
-    optimiser's own state is carried through `mx.compile`'s `inputs`/`outputs`,
-    which is what lets Adam's moments live inside the compiled graph rather than
-    forcing a synchronisation every step.
-    """
-    loss_fn = make_loss(config, steps)
-    value_and_grad = mx.value_and_grad(loss_fn)
-    state = [optimizer.state]
-
-    def step(
-        params: Params,
-        batch: dict[str, mx.array],
-        static_tree: dict[str, mx.array],
-    ) -> tuple[Params, mx.array]:
-        loss, grads = value_and_grad(params, batch, static_tree)
-        updated: Params = optimizer.apply_gradients(grads, params)
-        return updated, loss
 
     if not compile_step:
         return step

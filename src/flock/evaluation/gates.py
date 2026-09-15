@@ -87,10 +87,61 @@ class GateResult:
     note: str = ""
 
 
-def evaluate_gate(key: str, metrics: dict[str, float]) -> GateResult:
-    """Evaluate one gate against a metrics dictionary.
+BY_KEY = {gate.key: gate for gate in GATES}
 
-    Raises:
-        NotImplementedError: G0 lands at M1; the rest at M4.
+
+def evaluate_gate(key: str, metrics: dict[str, float]) -> GateResult:
+    """Evaluate one gate against measured metrics.
+
+    Thresholds live here rather than in the caller so a gate cannot be quietly
+    relaxed to fit a result. A metric the caller did not supply gives
+    `NOT_RUN`, never a pass.
     """
-    raise NotImplementedError("M1 (G0) / M4 (G1-G4): gate evaluation")
+    gate = BY_KEY[key]
+
+    def need(*names: str) -> bool:
+        return all(name in metrics for name in names)
+
+    if key == "G0":
+        if not need("coverage_mean", "coverage_p5"):
+            return GateResult(gate, GateStatus.NOT_RUN, metrics)
+        ok = metrics["coverage_mean"] >= 0.98 and metrics["coverage_p5"] >= 0.90
+    elif key == "G0.5":
+        if not need("final_l1", "seconds"):
+            return GateResult(gate, GateStatus.NOT_RUN, metrics)
+        ok = metrics["final_l1"] < 0.05 and metrics["seconds"] < 600
+    elif key == "G1":
+        # Both halves, and the second is the one that decides P1: a recurrence
+        # gain over a single pass means little if plain unshared depth matches
+        # it at the same quality.
+        if not need("l1_t1", "l1_t8", "b3_l1_t8", "params", "b3_params"):
+            return GateResult(gate, GateStatus.NOT_RUN, metrics)
+        gain = metrics["l1_t8"] <= 0.80 * metrics["l1_t1"]
+        competitive = metrics["l1_t8"] <= 1.05 * metrics["b3_l1_t8"]
+        smaller = metrics["params"] < metrics["b3_params"]
+        ok = gain and competitive and smaller
+        note = (
+            f"gain {'ok' if gain else 'FAIL'}; "
+            f"vs B3 {'ok' if competitive else 'FAIL'}; "
+            f"smaller {'ok' if smaller else 'FAIL'}"
+        )
+        return GateResult(gate, GateStatus.PASS if ok else GateStatus.FAIL, metrics, note)
+    elif key == "G2":
+        if not need("l1_t8", "l1_t32"):
+            return GateResult(gate, GateStatus.NOT_RUN, metrics)
+        ok = metrics["l1_t32"] <= 1.05 * metrics["l1_t8"]
+    elif key == "G3":
+        if not need("repaired_fraction", "collateral_relative"):
+            return GateResult(gate, GateStatus.NOT_RUN, metrics)
+        ok = metrics["repaired_fraction"] >= 0.80 and metrics["collateral_relative"] < 0.10
+    elif key == "G4":
+        if not need("deformation", "b1_deformation", "b5_deformation"):
+            return GateResult(gate, GateStatus.NOT_RUN, metrics)
+        ok = (
+            metrics["deformation"] < metrics["b1_deformation"]
+            and metrics["deformation"] < metrics["b5_deformation"]
+        )
+    else:
+        raise KeyError(f"unknown gate {key!r}")
+
+    return GateResult(gate, GateStatus.PASS if ok else GateStatus.FAIL, metrics)

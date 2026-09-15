@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -16,7 +17,13 @@ from flock.domain.skinning.corruption import (
 )
 from flock.domain.skinning.weights import WeightField
 from flock.experiment.repository import RunRepository, make_run_name
-from flock.training.curriculum import default_curriculum, sample_levels, stage_for
+from flock.training.curriculum import (
+    confident_error_curriculum,
+    default_curriculum,
+    sample_levels,
+    stage_for,
+    with_clean_share,
+)
 
 V, B = 1024, 8
 
@@ -32,6 +39,8 @@ def make_context(live: int = 200) -> CorruptionContext:
         neighbour_mask=np.tile(vertex_mask[:, None], (1, 8)),
         vertex_mask=vertex_mask,
         candidate_bones=np.tile(np.arange(B, dtype=np.int32), (V, 1)),
+        candidate_mask=np.ones((V, B), dtype=bool),
+        candidate_distances=np.tile(np.linspace(0.1, 0.8, B).astype(np.float32), (V, 1)),
         bone_parents=np.array([-1, *range(B - 1)], dtype=np.int32),
     )
 
@@ -56,7 +65,10 @@ class TestCorruption:
         [
             CorruptionLevel.C0_GAUSSIAN_LOGITS,
             CorruptionLevel.C1_LOCAL_PATCH,
+            CorruptionLevel.C1P_PERMUTED_PATCH,
             CorruptionLevel.C2_HIERARCHY_TRANSFER,
+            CorruptionLevel.C3_NAIVE_GEOMETRIC,
+            CorruptionLevel.C4_NEAR_UNIFORM,
         ],
     )
     def test_every_level_returns_a_valid_field(self, level: CorruptionLevel) -> None:
@@ -96,12 +108,82 @@ class TestCorruption:
             field.values[rows][:, [1, 3]].sum(axis=1).mean()
         )
 
-    def test_unimplemented_levels_say_so(self) -> None:
-        with pytest.raises(NotImplementedError, match=r"V0\.5"):
-            corrupt(
-                make_field(), CorruptionLevel.C4_NEAR_UNIFORM, make_context(),
-                np.random.default_rng(0),
-            )
+    def test_c1p_preserves_the_shape_of_every_row(self) -> None:
+        """C1P is the peaked half of C1: the row keeps its distribution exactly
+        and only its *identity* is wrong. That is the whole point — a corruption
+        the model cannot spot by flatness alone (ADR-0008)."""
+        field = make_field()
+        out, patch = corrupt(
+            field, CorruptionLevel.C1P_PERMUTED_PATCH, make_context(), np.random.default_rng(0)
+        )
+        rows = np.flatnonzero(patch)
+        assert rows.size
+        before = np.sort(field.values[rows], axis=1)
+        after = np.sort(out.values[rows], axis=1)
+        assert after == pytest.approx(before, abs=1e-6)
+
+    def test_c1p_moves_the_dominant_bone(self) -> None:
+        """Preserving the shape is only useful if the answer actually changes."""
+        field = make_field()
+        out, patch = corrupt(
+            field, CorruptionLevel.C1P_PERMUTED_PATCH, make_context(), np.random.default_rng(0)
+        )
+        rows = np.flatnonzero(patch)
+        moved = out.values[rows].argmax(axis=1) != field.values[rows].argmax(axis=1)
+        assert moved.mean() > 0.5
+
+    def test_c1p_keeps_mass_on_real_candidates(self) -> None:
+        """A padding slot names no bone, so mass permuted onto one is nonsense."""
+        context = make_context()
+        mask = context.candidate_mask.copy()
+        mask[:, 4:] = False
+        narrowed = replace(context, candidate_mask=mask)
+        out, patch = corrupt(
+            make_field(), CorruptionLevel.C1P_PERMUTED_PATCH, narrowed,
+            np.random.default_rng(0),
+        )
+        assert not out.values[np.flatnonzero(patch)][:, 4:].any()
+
+    def test_c3_ignores_the_field_it_is_handed(self) -> None:
+        """The R7 guarantee, as a test rather than a promise.
+
+        C3 is the initialisation gate G4 starts from. If it read the weights it
+        was passed, it would carry ground truth into the one measurement that
+        exists to show the model can solve rather than repair — and the leak
+        would be invisible in the result.
+        """
+        context = make_context()
+        truth = make_field()
+        scrambled = WeightField(np.zeros_like(truth.values))
+        a, _ = corrupt(truth, CorruptionLevel.C3_NAIVE_GEOMETRIC, context,
+                       np.random.default_rng(0))
+        b, _ = corrupt(scrambled, CorruptionLevel.C3_NAIVE_GEOMETRIC, context,
+                       np.random.default_rng(1))
+        assert a.values == pytest.approx(b.values)
+
+    def test_c3_favours_the_nearer_bone(self) -> None:
+        """Inverse-square over candidate distance, so slot 0 must dominate."""
+        out, region = corrupt(make_field(), CorruptionLevel.C3_NAIVE_GEOMETRIC,
+                              make_context(), np.random.default_rng(0))
+        rows = out.values[:200]
+        assert (rows[:, 0] > rows[:, -1]).all()
+        assert region[:200].all()          # a global initialisation, not a patch
+
+    def test_c4_is_near_uniform(self) -> None:
+        """C4 must leave the dynamics almost nothing to go on but its own rule."""
+        out, _ = corrupt(make_field(), CorruptionLevel.C4_NEAR_UNIFORM,
+                         make_context(), np.random.default_rng(0))
+        rows = out.values[:200]
+        assert rows.max(axis=1).mean() < 0.30       # uniform over 8 would be 0.125
+        assert rows.min(axis=1).mean() > 0.01
+
+    def test_c4_ignores_the_field_it_is_handed(self) -> None:
+        context = make_context()
+        a, _ = corrupt(make_field(), CorruptionLevel.C4_NEAR_UNIFORM, context,
+                       np.random.default_rng(7))
+        b, _ = corrupt(WeightField(np.zeros((V, B), dtype=np.float32)),
+                       CorruptionLevel.C4_NEAR_UNIFORM, context, np.random.default_rng(7))
+        assert a.values == pytest.approx(b.values)
 
 
 class TestStatePool:
@@ -187,6 +269,23 @@ class TestCurriculum:
             stages[0].mixture[CorruptionLevel.C0_GAUSSIAN_LOGITS]
             > stages[2].mixture[CorruptionLevel.C0_GAUSSIAN_LOGITS]
         )
+
+    def test_clean_share_moves_only_the_clean_to_corrupted_ratio(self) -> None:
+        """The lever for ADR-0010: every other level's share must be untouched,
+        or the arm tests two things at once."""
+        base = confident_error_curriculum()
+        lowered = with_clean_share(base, 0.1)
+        for before, after in zip(base, lowered, strict=True):
+            assert after.mixture[CorruptionLevel.CLEAN] == pytest.approx(0.1)
+            assert sum(after.mixture.values()) == pytest.approx(sum(before.mixture.values()))
+            for level in (CorruptionLevel.C1_LOCAL_PATCH, CorruptionLevel.C1P_PERMUTED_PATCH):
+                assert after.mixture.get(level, 0.0) == pytest.approx(
+                    before.mixture.get(level, 0.0)
+                )
+
+    def test_clean_share_refuses_an_impossible_value(self) -> None:
+        with pytest.raises(ValueError, match="clean share"):
+            with_clean_share(default_curriculum(), 1.0)
 
     def test_sampling_respects_the_mixture(self) -> None:
         drawn = sample_levels(default_curriculum(), 0, 4000, np.random.default_rng(0))

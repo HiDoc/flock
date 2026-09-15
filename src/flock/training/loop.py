@@ -51,6 +51,14 @@ class TrainConfig:
     """Poses drawn per step for L_deform (spec §3.3: 2-4 from a bank of 16-32).
     Posing the whole bank costs several times the rollout for no extra signal."""
 
+    confident_error: bool = False
+    """Spend half of C1's share on C1P, the peaked corruption (ADR-0008). The
+    default curriculum only ever asks the model to repair flat states, which is
+    what lets peakedness stand in for "needs work"."""
+
+    clean_share: float | None = None
+    """Override the curriculum's clean share (ADR-0010). None keeps it as is."""
+
     log_every: int = 50
     """Metrics are pulled off the GPU in batches; reading them every step would
     serialise the pipeline (spec §3.5)."""
@@ -73,24 +81,28 @@ def train(
     """
     import time
 
-    import mlx.core as mx
-    import mlx.optimizers as optim
     import numpy as np
 
-    from flock.backends.mlx.cell import init_params
-    from flock.backends.mlx.train_step import make_pool_train_step
+    from flock.backends.registry import get_backend
     from flock.data.store import DatasetRepository
     from flock.domain.dynamics.pool import StatePool
     from flock.domain.geometry.mesh import NUM_CANDIDATES, NUM_VERTICES
     from flock.domain.skinning.corruption import CorruptionLevel, corrupt
     from flock.experiment.repository import RunRepository
-    from flock.training.batch import MeshBank, logits_from_weights
-    from flock.training.curriculum import default_curriculum, sample_levels
+    from flock.training.batch import logits_from_weights
+    from flock.training.curriculum import (
+        confident_error_curriculum,
+        default_curriculum,
+        sample_levels,
+        with_clean_share,
+    )
+
+    backend = get_backend(config.backend, config.cell)
 
     repo = DatasetRepository(cache)
     ids = repo.list_ids()[:num_meshes]
     samples = [repo.load(i)[0] for i in ids]
-    bank = MeshBank(samples)
+    bank = backend.make_bank(samples)
     contexts = [s.corruption_context() for s in samples]
     truth = [s.ground_truth for s in samples]
 
@@ -102,13 +114,17 @@ def train(
         len(samples), NUM_VERTICES, config.cell.hidden_dim, NUM_CANDIDATES,
         size=config.pool_size, seed=config.seed,
     )
-    stages = default_curriculum()
+    stages = confident_error_curriculum() if config.confident_error else default_curriculum()
+    if config.clean_share is not None:
+        stages = with_clean_share(stages, config.clean_share)
 
-    params = init_params(config.cell, config.seed)
-    optimizer = optim.AdamW(learning_rate=config.learning_rate, weight_decay=config.weight_decay)
-    step_fn = make_pool_train_step(config.cell, config.bptt_steps, optimizer)
+    params = backend.init_params(config.cell, config.seed, config.bptt_steps + 1)
+    step_fn = backend.make_pool_step(
+        config.cell, config.bptt_steps, config.learning_rate, config.weight_decay
+    )
 
-    started = time.time()
+    started = last_logged = time.time()
+    logged_at_step = 0
     for step in range(1, config.max_steps + 1):
         plan = pool.plan_batch(config.batch_size)
         meshes = pool.mesh_index[plan.slots]
@@ -132,37 +148,38 @@ def train(
             samples[0].train_poses.num_poses, size=config.poses_per_step, replace=False
         )
         static, extras = bank.gather(meshes, poses)
-        payload = {
-            "hidden": mx.array(hidden),
-            "logits": mx.array(logits),
-            "w_weight": mx.array(config.losses.weight_l1),
-            "w_deform": mx.array(config.losses.deformation_at(step)),
-            "w_stability": mx.array(config.losses.stability),
-            **extras,
-        }
-        params, total, new_hidden, new_logits, parts = step_fn(params, payload, static)
+        params, metrics, new_hidden, new_logits = step_fn(
+            params, hidden, logits, static, extras,
+            {
+                "weight": config.losses.weight_l1,
+                "deform": config.losses.deformation_at(step),
+                "stability": config.losses.stability,
+            },
+        )
 
         if step % config.log_every == 0 or step == config.max_steps:
-            mx.eval(params, total, new_hidden, new_logits, *parts)
+            now = time.time()
+            # Per-interval rate, not just cumulative elapsed. A suspended laptop
+            # inflates wall-clock without doing any work, and comparing two runs
+            # by elapsed seconds would then be meaningless (spec §8 wants runs
+            # comparable). The median of these intervals is the honest figure.
+            interval_rate = (step - logged_at_step) / max(now - last_logged, 1e-9)
+            last_logged, logged_at_step = now, step
             runs.record_metrics(run_name, {
                 "step": step,
-                "loss": float(total),
-                "l_weight": float(parts[0]),
-                "l_deform": float(parts[1]),
-                "l_stability": float(parts[2]),
-                "seconds": time.time() - started,
+                **metrics,
+                "steps_per_second": interval_rate,
+                "seconds": now - started,
                 **pool.age_histogram(),
                 **pool.level_counts(),
             })
         if step % config.checkpoint_every == 0:
             # A run that dies at step 2000 of 6000 should still be evaluable.
             # Metrics already survive that way; the checkpoint has to as well.
-            mx.eval(params)
             runs.save_checkpoint(run_name, params)
         # States go back detached: gradients span k steps, the dynamics spans the pool.
-        pool.write(plan.slots, np.array(new_hidden), np.array(new_logits), config.bptt_steps)
+        pool.write(plan.slots, new_hidden, new_logits, config.bptt_steps)
 
-    mx.eval(params)
     runs.save_checkpoint(run_name, params)
 
 
@@ -184,16 +201,14 @@ def overfit_single_mesh(
     """
     import time
 
-    import mlx.core as mx
-    import mlx.optimizers as optim
     import numpy as np
 
-    from flock.backends.mlx.cell import init_params
-    from flock.backends.mlx.train_step import make_train_step
+    from flock.backends.registry import get_backend
     from flock.data.store import DatasetRepository
     from flock.domain.skinning.corruption import CorruptionLevel, corrupt
-    from flock.training.batch import build_batch
+    from flock.training.batch import logits_from_weights
 
+    backend = get_backend(config.backend, config.cell)
     repo = DatasetRepository(cache)
     sample, _ = repo.load(mesh_id)
     rng = np.random.default_rng(config.seed)
@@ -213,34 +228,35 @@ def overfit_single_mesh(
             for _ in range(copies)
         ]
     )
-    batch = build_batch([sample] * copies, corrupted)
-    tree = batch.static.as_tree()
-    payload = {"initial_logits": batch.initial_logits, "target": batch.target}
+    bank = backend.make_bank([sample] * copies)
+    static, extras = bank.gather(np.arange(copies), np.arange(config.poses_per_step))
 
     live = sample.mesh.vertex_mask
     start_l1 = float(
         np.abs(corrupted - sample.ground_truth.values[None])[:, live].sum(axis=-1).mean()
     )
 
-    params = init_params(config.cell, config.seed)
-    optimizer = optim.AdamW(learning_rate=config.learning_rate, weight_decay=config.weight_decay)
-    step = make_train_step(config.cell, config.bptt_steps, optimizer)
+    # The same pooled step, with the pool switched off: the state is reset from
+    # the corrupted field every iteration. One code path, so the gate exercises
+    # the machinery the real runs use.
+    params = backend.init_params(config.cell, config.seed)
+    step = backend.make_pool_step(
+        config.cell, config.bptt_steps, config.learning_rate, config.weight_decay
+    )
+    hidden = np.zeros((copies, corrupted.shape[1], config.cell.hidden_dim), dtype=np.float32)
+    logits = logits_from_weights(corrupted)
+    only_weight_l1 = {"weight": 1.0, "deform": 0.0, "stability": 0.0}
 
-    started, loss = time.time(), mx.array(0.0)
+    started, metrics = time.time(), {"l_weight": float("nan")}
     taken = 0
     for taken in range(1, config.max_steps + 1):
-        params, loss = step(params, payload, tree)
-        # Metrics are pulled off device in batches; reading every step would
-        # serialise the pipeline (spec §3.5).
-        if taken % config.log_every == 0:
-            mx.eval(params, loss)
-            if time.time() - started > time_budget_seconds:
-                break
-    mx.eval(params, loss)
+        params, metrics, _, _ = step(params, hidden, logits, static, extras, only_weight_l1)
+        if taken % config.log_every == 0 and time.time() - started > time_budget_seconds:
+            break
 
     elapsed = time.time() - started
     return {
-        "final_l1": float(loss),
+        "final_l1": metrics["l_weight"],
         "start_l1": start_l1,
         "steps": float(taken),
         "seconds": elapsed,

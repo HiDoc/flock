@@ -13,12 +13,16 @@ HIDDEN_DIM = 32
 """Default hidden width H (spec §3.4); swept by ablation A9 over {16, 32, 64}."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class CellConfig:
     """Hyperparameters of one cell (spec §2.3, §2.4, §3.4).
 
     The defaults give roughly 40-60k parameters — an order of magnitude under
     the brief's 1-2M ceiling, which is the point (spec H6).
+
+    Keyword-only on purpose: `CellConfig(True)` reads as "shared weights" and
+    silently sets `hidden_dim=1` instead, which fails much later and looks like
+    a shape bug in the cell.
     """
 
     hidden_dim: int = HIDDEN_DIM
@@ -38,7 +42,13 @@ class CellConfig:
     tests 0.5, the NCA setting known to harden attractors."""
 
     shared_weights: bool = True
-    """False reproduces an unshared-depth baseline for ablation A2."""
+    """False gives every rollout step its own parameters — baseline B3 and
+    ablation A2, the same depth at roughly T times the parameter count."""
+
+    absolute_logits: bool = False
+    """True predicts the logits outright instead of a damped delta (ablation
+    A4). The delta form is the design: it makes `Delta z -> 0` a representable
+    fixed point, which absolute prediction cannot express."""
 
 
 @dataclass(frozen=True)

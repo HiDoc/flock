@@ -17,6 +17,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
+
+import numpy as np
+from numpy.typing import NDArray
 
 
 class BaselineKind(StrEnum):
@@ -55,10 +59,113 @@ class ReynoldsWeights:
     step: float
 
 
-def run_baseline(kind: BaselineKind, mesh_id: int, iterations: int) -> dict[str, float]:
-    """Evaluate one baseline on one mesh, reporting metrics by iteration.
+DEFAULT_REYNOLDS = ReynoldsWeights(separation=1.0, alignment=0.5, cohesion=1.0, step=0.3)
+"""Grid-searched starting point for B5; `tune_reynolds` refines it per dataset."""
 
-    Raises:
-        NotImplementedError: Implemented at milestone M4.
+
+def inverse_distance_weights(sample: Any) -> NDArray[np.float32]:
+    """B1: normalised inverse-square distance over the candidates.
+
+    The standard geometric heuristic and the floor any learned model has to
+    clear. It reads only the candidate distances — no training, no ground truth.
     """
-    raise NotImplementedError("M4: baselines")
+    distances = np.maximum(sample.candidates.distances.astype(np.float64), 1e-6)
+    weights = sample.candidates.mask / (distances**2)
+    total = weights.sum(axis=1, keepdims=True)
+    np.divide(weights, total, out=weights, where=total > 0)
+    normalised: NDArray[np.float32] = weights.astype(np.float32)
+    return normalised
+
+
+def reynolds_step(
+    weights: NDArray[np.float32],
+    sample: Any,
+    coefficients: ReynoldsWeights,
+) -> NDArray[np.float32]:
+    """One iteration of Reynolds' three rules, hand-coded (B5).
+
+    * **alignment** — diffuse each vertex's weights towards its neighbours', the
+      direct analogue of matching a neighbour's heading;
+    * **cohesion** — pull mass towards candidates that are near in diffusion
+      distance, the attraction term;
+    * **separation** — attenuate mass on candidates that are far, the repulsion
+      that keeps geodesically distant bones out.
+
+    Zero learning: three fixed rules and a step size. If this suffices, learning
+    the cell is not justified (spec §0.2), which is what makes B5 the necessity
+    test for the whole framing rather than a courtesy comparison.
+    """
+    neighbours = sample.mesh.neighbours
+    mask = sample.mesh.neighbour_mask[:, :, None]
+    live = np.maximum(mask.sum(axis=1), 1.0)
+    alignment = (weights[neighbours] * mask).sum(axis=1) / live
+
+    distances = np.maximum(sample.candidates.distances.astype(np.float64), 1e-6)
+    near = sample.candidates.mask / (distances**2)
+    total = near.sum(axis=1, keepdims=True)
+    np.divide(near, total, out=near, where=total > 0)
+
+    scale = np.median(distances[sample.candidates.mask]) if sample.candidates.mask.any() else 1.0
+    separation = np.exp(-distances / max(scale, 1e-6)) * sample.candidates.mask
+
+    target = (
+        coefficients.alignment * alignment
+        + coefficients.cohesion * near
+        + coefficients.separation * weights * separation
+    )
+    updated = (1.0 - coefficients.step) * weights + coefficients.step * target
+    updated = np.clip(updated, 0.0, None) * sample.candidates.mask
+    total = updated.sum(axis=1, keepdims=True)
+    np.divide(updated, total, out=updated, where=total > 0)
+    stepped: NDArray[np.float32] = updated.astype(np.float32)
+    return stepped
+
+
+def run_reynolds(
+    sample: Any,
+    initial: NDArray[np.float32],
+    iterations: int,
+    coefficients: ReynoldsWeights = DEFAULT_REYNOLDS,
+) -> NDArray[np.float32]:
+    """Iterate B5's fixed rules `iterations` times."""
+    weights = initial.astype(np.float32)
+    for _ in range(iterations):
+        weights = reynolds_step(weights, sample, coefficients)
+    return weights
+
+
+def tune_reynolds(
+    samples: list[Any],
+    initials: NDArray[np.float32],
+    iterations: int = 8,
+    seed: int = 0,
+) -> tuple[ReynoldsWeights, float]:
+    """Grid-search B5's coefficients, as spec §4.2 requires.
+
+    An untuned hand-coded baseline is a straw man; the comparison only means
+    something if the fixed rules were given their best shot.
+    """
+    from flock.domain.skinning.metrics import weight_l1
+    from flock.domain.skinning.weights import WeightField
+
+    # The grid reaches well below the obvious values. A coarse grid that only
+    # offers strong coefficients would let B5 lose to its own step size rather
+    # than to the hypothesis, and "three fixed rules do not suffice" is only
+    # worth saying if the rules were given their best shot (spec §4.2).
+    best, best_score = DEFAULT_REYNOLDS, float("inf")
+    grid = [0.0, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0]
+    for separation in grid:
+        for alignment in grid:
+            for cohesion in grid:
+                for step in (0.02, 0.05, 0.1, 0.3, 0.5):
+                    candidate = ReynoldsWeights(separation, alignment, cohesion, step)
+                    score = float(np.mean([
+                        weight_l1(
+                            WeightField(run_reynolds(s, initials[i], iterations, candidate)),
+                            s.ground_truth,
+                        )
+                        for i, s in enumerate(samples)
+                    ]))
+                    if score < best_score:
+                        best, best_score = candidate, score
+    return best, best_score

@@ -34,6 +34,7 @@ Written against raw `mx` with fixed shapes and gather-only access, so
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import mlx.core as mx
@@ -69,12 +70,66 @@ def _mlp(
 def _apply_mlp(params: dict[str, mx.array], x: mx.array) -> mx.array:
     """Two-layer MLP with a GELU nonlinearity."""
     hidden = mx.matmul(x, params["w1"]) + params["b1"]
-    hidden = hidden * mx.sigmoid(1.702 * hidden)
-    return mx.matmul(hidden, params["w2"]) + params["b2"]
+    return _mlp_tail(params, hidden)
 
 
-def init_params(config: CellConfig, seed: int) -> Params:
-    """Initialise the parameter tree for one cell."""
+def _mlp_tail(params: dict[str, mx.array], pre_activation: mx.array) -> mx.array:
+    """GELU plus the second layer, given the first layer's pre-activation."""
+    activated = pre_activation * mx.sigmoid(1.702 * pre_activation)
+    return mx.matmul(activated, params["w2"]) + params["b2"]
+
+
+def _project_broadcast(x: mx.array, weight: mx.array) -> mx.array:
+    """Project `[N, V, C]` then broadcast over the neighbour/candidate axis.
+
+    The first layer of an MLP over `concat([a, b, c])` is
+    `a @ W_a + b @ W_b + c @ W_c`, so an operand that is constant along the
+    gathered axis can be projected *before* it is broadcast rather than after.
+
+    That matters here because `h_v` enters three MLPs broadcast over K=8 or B=8.
+    Materialising `[N, V, 8, H]` and multiplying it by the full concatenated
+    weight costs eight times the arithmetic and eight times the memory traffic
+    of projecting `[N, V, H]` once. The result is identical; only the order of
+    the sum changes.
+    """
+    return mx.expand_dims(mx.matmul(x, weight), 2)
+
+
+def layer_params(params: Params, step: int, shared: bool) -> Params:
+    """The parameter set in force at rollout step `step`.
+
+    Shared weights are the hypothesis (P1): one rule, iterated. Unshared weights
+    give every step its own parameters, which is baseline B3 and ablation A2 —
+    the same depth at roughly T times the parameter count. Beyond the number of
+    layers trained, indexing cycles, so a T-sweep runs without crashing; past
+    that point an unshared model is repeating layers rather than extending, and
+    only its native depth is a fair reading.
+    """
+    if shared:
+        return params
+    depth = next(iter(next(iter(params.values())).values())).shape[0]
+    index = step % depth
+    return {group: {key: value[index] for key, value in entries.items()}
+            for group, entries in params.items()}
+
+
+def init_params(config: CellConfig, seed: int, depth: int = 1) -> Params:
+    """Initialise the parameter tree for one cell.
+
+    With `config.shared_weights` the tree holds one set, reused at every step.
+    Without it, every array grows a leading `depth` axis: same structure, same
+    checkpoint format, `depth` times the parameters.
+    """
+    if not config.shared_weights:
+        sets = [init_params(replace(config, shared_weights=True), seed * 977 + i)
+                for i in range(depth)]
+        return {
+            group: {
+                key: mx.stack([one[group][key] for one in sets])
+                for key in sets[0][group]
+            }
+            for group in sets[0]
+        }
     keys = list(mx.random.split(mx.random.key(seed), 10))
     hidden, width = config.hidden_dim, config.mlp_width
 
@@ -132,40 +187,50 @@ def cell_step(
     state: CellState,
     static: StaticInputs,
     config: CellConfig,
+    step: int = 0,
 ) -> CellState:
     """Apply the cell once."""
+    params = layer_params(params, step, config.shared_weights)
     hidden, logits = state.hidden, state.logits
     weights = mx.softmax(logits / config.temperature, axis=-1)
 
-    # Mesh messages over the one-ring.
+    # Mesh messages over the one-ring. The weight rows are split in the same
+    # order the inputs were concatenated in: [h_u, h_v, e_uv].
+    width = hidden.shape[-1]
+    message_weight = params["msg"]["w1"]
     neighbour_hidden = _gather_neighbours(hidden, static.neighbours)
-    self_hidden = mx.broadcast_to(
-        mx.expand_dims(hidden, 2), neighbour_hidden.shape
+    message_pre = (
+        mx.matmul(neighbour_hidden, message_weight[:width])
+        + _project_broadcast(hidden, message_weight[width : 2 * width])
+        + mx.matmul(static.edge_features, message_weight[2 * width :])
+        + params["msg"]["b1"]
     )
-    message_input = mx.concatenate(
-        [neighbour_hidden, self_hidden, static.edge_features], axis=-1
-    )
-    messages = _apply_mlp(params["msg"], message_input)
+    messages = _mlp_tail(params["msg"], message_pre)
 
     mask = mx.expand_dims(static.neighbour_mask, -1)
     live = mx.maximum(mx.sum(mask, axis=2), 1.0)
-    mean_message = mx.sum(messages * mask, axis=2) / live
+    # Named once and used by both reductions. Measured as no faster — the
+    # compiler already eliminates the common subexpression — so this is for the
+    # reader, not the clock.
+    masked_messages = messages * mask
+    mean_message = mx.sum(masked_messages, axis=2) / live
     # Masked slots must not win the max; -inf would poison the gradient.
-    max_message = mx.max(messages * mask + (mask - 1.0) * 1e4, axis=2)
+    max_message = mx.max(masked_messages + (mask - 1.0) * 1e4, axis=2)
 
     # Bone channel: the long-range shortcut that makes a small T viable (H2).
-    bone_input = mx.concatenate(
-        [
-            mx.broadcast_to(
-                mx.expand_dims(hidden, 2),
-                (*static.pair_features.shape[:3], hidden.shape[-1]),
-            ),
-            static.pair_features,
-            mx.expand_dims(weights, -1),
-        ],
-        axis=-1,
+    # Rows split as [h_v, f_vb, w_vb]; only h_v is constant along the candidate
+    # axis, so only it is projected before broadcasting.
+    pair_width = static.pair_features.shape[-1]
+    expanded_weights = mx.expand_dims(weights, -1)
+    bone_weight = params["bone"]["w1"]
+    pair_contribution = (
+        mx.matmul(static.pair_features, bone_weight[width : width + pair_width])
+        + mx.matmul(expanded_weights, bone_weight[width + pair_width :])
+        + params["bone"]["b1"]
     )
-    bone_messages = _apply_mlp(params["bone"], bone_input)
+    bone_messages = _mlp_tail(
+        params["bone"], _project_broadcast(hidden, bone_weight[:width]) + pair_contribution
+    )
     candidate_mask = mx.expand_dims(static.candidate_mask, -1)
     bone_summary = mx.sum(bone_messages * candidate_mask, axis=2) / mx.maximum(
         mx.sum(candidate_mask, axis=2), 1.0
@@ -176,20 +241,23 @@ def cell_step(
     )
     new_hidden = gru_cell(params["gru"], hidden, gate_input)
 
-    # Damped deltas on the logits: dz -> 0 is the fixed point (A4).
-    delta_input = mx.concatenate(
-        [
-            mx.broadcast_to(
-                mx.expand_dims(new_hidden, 2),
-                (*static.pair_features.shape[:3], new_hidden.shape[-1]),
-            ),
-            static.pair_features,
-            mx.expand_dims(weights, -1),
-        ],
-        axis=-1,
+    # Damped deltas on the logits: dz -> 0 is the fixed point (A4). Same input
+    # layout as the bone MLP, but reading the *updated* hidden state.
+    out_weight = params["out"]["w1"]
+    delta_pre = (
+        _project_broadcast(new_hidden, out_weight[:width])
+        + mx.matmul(static.pair_features, out_weight[width : width + pair_width])
+        + mx.matmul(expanded_weights, out_weight[width + pair_width :])
+        + params["out"]["b1"]
     )
-    delta = mx.squeeze(_apply_mlp(params["out"], delta_input), -1)
-    new_logits = logits + config.delta_scale * delta * static.candidate_mask
+    delta = mx.squeeze(_mlp_tail(params["out"], delta_pre), -1)
+    if config.absolute_logits:
+        # Ablation A4: predict the logits outright instead of a damped delta.
+        # This is the disguised feed-forward GNN — the last iteration overwrites
+        # everything before it, and no fixed point is representable.
+        new_logits = delta * static.candidate_mask
+    else:
+        new_logits = logits + config.delta_scale * delta * static.candidate_mask
 
     vertex_mask = mx.expand_dims(static.vertex_mask, -1)
     return CellState(

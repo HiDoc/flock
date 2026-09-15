@@ -20,8 +20,12 @@ FORBIDDEN: dict[str, tuple[str, ...]] = {
     "data": ("mlx", "flock.backends", "flock.training", "flock.evaluation", "flock.cli"),
     "backends": ("igl", "potpourri3d", "trimesh", "flock.training",
                  "flock.evaluation", "flock.cli"),
-    "training": ("igl", "potpourri3d", "flock.cli"),
-    "evaluation": ("igl", "potpourri3d", "flock.cli"),
+    # training and evaluation reach compute only through the port (ADR-0002).
+    # Naming a concrete adapter here is what made the port decorative once
+    # already: the loop imported `flock.backends.mlx` directly, held mx arrays,
+    # and `get_backend` was never called.
+    "training": ("igl", "potpourri3d", "flock.cli", "mlx", "flock.backends.mlx"),
+    "evaluation": ("igl", "potpourri3d", "flock.cli", "mlx", "flock.backends.mlx"),
     "experiment": ("mlx", "igl", "potpourri3d", "flock.cli"),
 }
 

@@ -22,8 +22,8 @@ def rollout(
     config: CellConfig,
 ) -> CellState:
     """Apply the cell `steps` times."""
-    for _ in range(steps):
-        state = cell_step(params, state, static, config)
+    for step in range(steps):
+        state = cell_step(params, state, static, config, step)
     return state
 
 
@@ -45,7 +45,7 @@ def rollout_trace(
     if 0 in wanted:
         captured[0] = state
     for step in range(1, max(wanted) + 1 if wanted else 1):
-        state = cell_step(params, state, static, config)
+        state = cell_step(params, state, static, config, step - 1)
         if step in wanted:
             captured[step] = state
     return captured
